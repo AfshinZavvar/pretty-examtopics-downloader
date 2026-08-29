@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -120,5 +121,47 @@ func TestFetchURLNonRetryableLogsAndReturnsNil(t *testing.T) {
 	}
 	if !strings.HasPrefix(srv.URL, "http://") {
 		t.Skip("test server URL unexpected; skipping format sanity check")
+	}
+}
+
+func TestFetchURLContextUsesSingleCombinedRetryDelay(t *testing.T) {
+	var hits int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&hits, 1) == 1 {
+			w.Header().Set("Retry-After", "2")
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer srv.Close()
+
+	started := time.Now()
+	body, metrics, err := FetchURLContext(context.Background(), srv.URL, http.Client{Timeout: 5 * time.Second}, RequestPolicy{
+		Timeout: 5 * time.Second, MaxRetries: 1, Pace: false,
+	})
+	elapsed := time.Since(started)
+	if err != nil || string(body) != "ok" || metrics.Retries != 1 {
+		t.Fatalf("retry failed: body=%q metrics=%+v err=%v", body, metrics, err)
+	}
+	if elapsed < 1800*time.Millisecond || elapsed > 2800*time.Millisecond {
+		t.Fatalf("expected one ~2s retry delay, got %v", elapsed)
+	}
+}
+
+func TestFetchURLContextCancellationStopsRetries(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, _, err := FetchURLContext(ctx, srv.URL, http.Client{}, RequestPolicy{
+		Timeout: 5 * time.Second, MaxRetries: 3, Pace: false,
+	})
+	if err == nil || time.Since(started) > 500*time.Millisecond {
+		t.Fatalf("cancellation was not prompt: elapsed=%v err=%v", time.Since(started), err)
 	}
 }

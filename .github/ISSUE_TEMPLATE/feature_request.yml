@@ -27,7 +27,7 @@ body:
     id: proposal
     attributes:
       label: Proposed solution
-      description: Describe the feature. If it's a CLI option, suggest a flag name and behavior (e.g. `--recent-comments-days N`).
+      description: Describe the feature. If it's a CLI option, suggest a flag name and behavior (e.g. `-recent-comments-days N`).
     validations:
       required: true
 

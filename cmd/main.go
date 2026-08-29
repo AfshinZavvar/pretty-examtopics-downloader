@@ -2,11 +2,15 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"flag"
 	"fmt"
+	"io"
 	"math"
 	"os"
+	"os/signal"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -44,9 +48,15 @@ func main() {
 }
 
 func run() error {
+	if wantsHelp(os.Args[1:]) {
+		printUsage(os.Stdout)
+		return nil
+	}
+
 	debug := flag.Bool("debug", false, "Enable debug logs")
-	noCache := flag.Bool("no-cache", false, "Bypass the on-disk question-page cache (always fetch fresh)")
-	recentDays := flag.Int("recent-comments-days", 0, "Keep only questions with a comment in the last N days (0 = ask interactively / disabled)")
+	noCache := flag.Bool("no-cache", false, "Bypass provider-index and question-page caches (always fetch fresh)")
+	refreshIndex := flag.Bool("refresh-index", false, "Force a fresh provider discussion index while retaining question-page cache entries")
+	recentDays := flag.Int("recent-comments-days", 0, "Filter by dated comment activity in the last N days; unknown dates remain")
 	flag.Parse()
 	fetch.SetDebug(*debug)
 	fetch.SetCacheEnabled(!*noCache)
@@ -74,32 +84,12 @@ func run() error {
 		return fmt.Errorf("failed reading provider selection: %w", err)
 	}
 
-	includeDiscussionExamDiscovery, err := promptYesNo(
-		reader,
-		fmt.Sprintf("Include discussion pages while discovering exams for %s? [y/N]: ", formatProviderName(selectedProvider)),
-		false,
-	)
-	if err != nil {
-		return fmt.Errorf("failed reading exam discovery mode: %w", err)
+	if *refreshIndex {
+		fetch.InvalidateProviderDiscussionIndex(selectedProvider)
 	}
 
-	selectedExam, err := promptSelectionWithRefresh(
-		reader,
-		fmt.Sprintf("Available Exams for %s", formatProviderName(selectedProvider)),
-		func() []string {
-			return getProviderExamSlugsWithStatus(selectedProvider, includeDiscussionExamDiscovery)
-		},
-		func(s string) string {
-			if s == "all-discussions" {
-				return "all-discussions (fallback)"
-			}
-			return s
-		},
-	)
+	selectedExam, err := promptExamSelection(reader, selectedProvider)
 	if err != nil {
-		if !includeDiscussionExamDiscovery && strings.Contains(strings.ToLower(err.Error()), "no options found") {
-			return fmt.Errorf("no official exams were found for %s. Run again and answer 'y' to include discussion pages", formatProviderName(selectedProvider))
-		}
 		return fmt.Errorf("failed reading exam selection: %w", err)
 	}
 	extractionFilter := selectedExam
@@ -117,7 +107,16 @@ func run() error {
 	}
 
 	printInfof("Starting extraction for %s / %s...\n", formatProviderName(selectedProvider), selectedExam)
-	links := fetch.GetAllPages(selectedProvider, extractionFilter)
+	extractionCtx, stopExtraction := signal.NotifyContext(context.Background(), os.Interrupt)
+	links, extractionErr := fetch.GetAllPages(extractionCtx, selectedProvider, extractionFilter, newCLIProgressReporter())
+	stopExtraction()
+	if extractionErr != nil {
+		if len(links) == 0 {
+			return fmt.Errorf("extraction failed: %w", extractionErr)
+		}
+		printWarnf("The question set is PARTIAL: %v\n", extractionErr)
+		printWarnf("Writing %d recovered question(s). Run again to resume discovery before treating the HTML as complete.\n", len(links))
+	}
 	if len(links) == 0 {
 		return fmt.Errorf("no matching questions were extracted")
 	}
@@ -125,14 +124,17 @@ func run() error {
 	if recentWindowDays > 0 {
 		before := len(links)
 		links = utils.FilterByRecentComments(links, recentWindowDays, time.Now())
-		printInfof("Recent-comment filter (last %d days): kept %d, dropped %d of %d question(s).\n",
+		printInfof("Recent-comment filter (last %d days; unknown dates retained): kept %d, dropped %d of %d question(s).\n",
 			recentWindowDays, len(links), before-len(links), before)
 		if len(links) == 0 {
-			return fmt.Errorf("no questions had a comment within the last %d days; rerun with a larger --recent-comments-days value or 0 to disable", recentWindowDays)
+			return fmt.Errorf("no questions remained after the %d-day comment-activity filter; rerun with a larger -recent-comments-days value or 0 to disable", recentWindowDays)
 		}
 	}
 
 	outputPath := defaultOutputPath(selectedProvider, selectedExam)
+	if extractionErr != nil {
+		outputPath = strings.TrimSuffix(outputPath, ".html") + ".partial.html"
+	}
 	headerExam := selectedExam
 	if selectedExam == "all-discussions" {
 		headerExam = ""
@@ -144,6 +146,40 @@ func run() error {
 
 	printSuccessf("Successfully saved output: %s\n", strings.Join(savedFiles, ", "))
 	return nil
+}
+
+func wantsHelp(args []string) bool {
+	for _, arg := range args {
+		switch strings.ToLower(strings.TrimSpace(arg)) {
+		case "/?", "-?", "-h", "--help", "-help", "help":
+			return true
+		}
+	}
+	return false
+}
+
+func printUsage(w io.Writer) {
+	fmt.Fprintln(w, "ExamTopics Downloader - Interactive Exam Extractor")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  examtopics-downloader-windows-amd64.exe [options]")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Options:")
+	fmt.Fprintln(w, "  -debug                    Enable diagnostic logs")
+	fmt.Fprintln(w, "  -no-cache                 Bypass provider-index and question-page caches")
+	fmt.Fprintln(w, "  -refresh-index            Rebuild the provider index; retain question cache")
+	fmt.Fprintln(w, "  -recent-comments-days N   Filter by recent dated comments; unknown dates remain")
+	fmt.Fprintln(w, "                             Use 0 to disable the filter")
+	fmt.Fprintln(w, "  -h, --help, /?            Show this help and exit")
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, "Interactive exam commands:")
+	fmt.Fprintln(w, "  az-305      Find exams containing az-305")
+	fmt.Fprintln(w, "  1           Select displayed item 1")
+	fmt.Fprintln(w, "  /clear      Show the full list again")
+	fmt.Fprintln(w, "  /reload     Reload official exams")
+	fmt.Fprintln(w, "  /scan       Resume public discussion discovery (two-minute pass)")
+	fmt.Fprintln(w, "  /all        Download indexed public provider discussions (may be partial)")
+	fmt.Fprintln(w, "Enter one item at a time, then press Enter.")
 }
 
 func pauseBeforeExitOnError() {
@@ -161,114 +197,202 @@ func pauseBeforeExitOnError() {
 
 func getProvidersWithStatus() []string {
 	printInfof("Loading providers from ExamTopics...\n")
-	fmt.Println(style("This may take a moment while data is fetched from exams and discussions.", ansiGray))
-
-	done := make(chan struct{})
+	fmt.Println(style("Fetching the exam and discussion indexes in parallel (Ctrl+C cancels).", ansiGray))
 	start := time.Now()
-
-	go func() {
-		ticker := time.NewTicker(15 * time.Second)
-		defer ticker.Stop()
-
-		status := []string{
-			"Still working: loading provider categories...",
-			"Still working: checking discussions-only providers...",
-			"Still working: organizing provider list...",
-		}
-		step := 0
-
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				elapsed := time.Since(start).Round(time.Second)
-				printInfof("%s Elapsed: %s\n", status[step], elapsed)
-				if step < len(status)-1 {
-					step++
-				}
-			}
-		}
-	}()
-
-	providers := fetch.GetAllProviders()
-	close(done)
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	providers, err := fetch.GetAllProvidersContext(ctx)
+	stop()
 
 	elapsed := time.Since(start).Round(time.Second)
+	if err != nil {
+		printWarnf("Provider loading ended after %s: %v\n", elapsed, err)
+		return providers
+	}
 	printSuccessf("Done. Found %d provider(s) in %s.\n", len(providers), elapsed)
 	return providers
 }
 
-func getProviderExamSlugsWithStatus(provider string, includeDiscussionExamDiscovery bool) []string {
+// promptExamSelection keeps the fast official list interactive. Exhaustive
+// provider discussion discovery is explicit via /scan and can be cancelled
+// without discarding already checkpointed pages.
+func promptExamSelection(reader *bufio.Reader, provider string) (string, error) {
 	providerLabel := formatProviderName(provider)
-	printSection(fmt.Sprintf("Exam Discovery: %s", providerLabel))
-	if includeDiscussionExamDiscovery {
-		fmt.Println(style("Scanning available exams (including discussion-derived variants).", ansiGray))
-	} else {
-		fmt.Println(style("Scanning available exams from the official provider exam list only.", ansiGray))
+	loadOfficial := func() ([]string, error) {
+		ctx, cancelTimeout := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancelTimeout()
+		ctx, stopSignal := signal.NotifyContext(ctx, os.Interrupt)
+		defer stopSignal()
+		return fetch.GetOfficialExamSlugs(ctx, provider)
 	}
 
-	done := make(chan struct{})
-	start := time.Now()
+	printSection(fmt.Sprintf("Exam Discovery: %s", providerLabel))
+	printInfof("Loading official exams (discussion scan is available later with /scan)...\n")
+	official, officialErr := loadOfficial()
+	if officialErr != nil {
+		printWarnf("Official exam list could not be loaded: %v\n", officialErr)
+	} else {
+		printSuccessf("Loaded %d official exam(s).\n", len(official))
+	}
 
-	go func() {
-		ticker := time.NewTicker(20 * time.Second)
-		defer ticker.Stop()
-
-		status := []string{
-			"Still working: checking available exam names...",
-			"Still working: loading the provider exam list...",
-			"Still working: organizing the exam list for you.",
-		}
-		if includeDiscussionExamDiscovery {
-			status[1] = "Still working: this provider has many discussion pages to review."
-		}
-		step := 0
-
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-				elapsed := time.Since(start).Round(time.Second)
-				printInfof("%s Elapsed: %s\n", status[step], elapsed)
-				if step < len(status)-1 {
-					step++
-				}
-			}
-		}
-	}()
-
-	examSlugs := fetch.GetProviderExamSlugs(provider, includeDiscussionExamDiscovery)
-	close(done)
-
-	elapsed := time.Since(start).Round(time.Second)
-	printSuccessf("Done. Found %d exam option(s) for %s in %s.\n", len(examSlugs), providerLabel, elapsed)
-
-	return examSlugs
+	cached, cacheHit := fetch.GetCachedProviderExamSlugs(provider)
+	if cacheHit {
+		printSuccessf("Added %d cached discussion-derived exam(s).\n", len(cached))
+	}
+	discussion := append([]string(nil), cached...)
+	scanDiscussions := func() (fetch.ProviderIndex, error) {
+		printInfof("Scanning discussion pages for additional exams. Press Ctrl+C to stop and keep partial results.\n")
+		scanCtx, stopScan := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stopScan()
+		return fetch.GetProviderDiscussionIndex(scanCtx, provider, fetch.IndexOptions{}, newCLIProgressReporter())
+	}
+	return promptExamMenu(reader, provider, official, discussion, loadOfficial, scanDiscussions)
 }
 
-func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) (bool, error) {
+func promptExamMenu(
+	reader *bufio.Reader,
+	provider string,
+	official []string,
+	discussion []string,
+	loadOfficial func() ([]string, error),
+	scanDiscussions func() (fetch.ProviderIndex, error),
+) (string, error) {
+	providerLabel := formatProviderName(provider)
+	options := fetch.MergeProviderExamSlugs(provider, official, discussion)
+	filter := ""
+
 	for {
-		fmt.Print(style(prompt, ansiBold+ansiCyan))
+		all := make([]selectionOption, 0, len(options))
+		for i, option := range options {
+			all = append(all, selectionOption{RawIndex: i, Label: option})
+		}
+		filtered := filterOptions(all, filter)
+		printMenuHeader(fmt.Sprintf("Available Exams for %s", providerLabel), len(filtered), len(all), filter)
+		if len(filtered) == 0 {
+			printWarnf("No exam choices are currently listed. Use /scan or /all.\n")
+		} else {
+			printOptionsInColumns(filtered)
+		}
+		printExamMenuHelp()
+		fmt.Print(style("Exam> ", ansiBold+ansiCyan))
 
 		raw, err := reader.ReadString('\n')
 		if err != nil {
-			return false, err
+			return "", err
+		}
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
 		}
 
-		answer := strings.ToLower(strings.TrimSpace(raw))
-		if answer == "" {
-			return defaultYes, nil
+		if command, value, isCommand := parseMenuCommand(raw); isCommand {
+			switch command {
+			case "clear":
+				filter = ""
+			case "all":
+				return "all-discussions", nil
+			case "refresh":
+				printInfof("Refreshing the official exam list...\n")
+				refreshed, refreshErr := loadOfficial()
+				if refreshErr != nil {
+					printWarnf("Official refresh failed; keeping the current list: %v\n", refreshErr)
+				} else {
+					official = refreshed
+					options = fetch.MergeProviderExamSlugs(provider, official, discussion)
+					filter = ""
+					printSuccessf("Official list refreshed; %d total option(s).\n", len(options))
+				}
+			case "scan":
+				index, scanErr := scanDiscussions()
+				discussion = index.ExamSlugs
+				options = fetch.MergeProviderExamSlugs(provider, official, discussion)
+				filter = ""
+				if scanErr != nil {
+					printWarnf("Discussion scan paused at %d/%d pages with %d exam code(s) found: %v\n", len(index.CompletedPages), index.TotalPages, len(index.ExamSlugs), scanErr)
+					printInfof("Run /scan again to resume from page %d; completed pages are cached.\n", len(index.CompletedPages)+1)
+				} else {
+					printSuccessf("Discussion scan complete; %d total exam option(s).\n", len(options))
+				}
+			case "filter":
+				if value == "" {
+					printWarnf("Filter text is missing. Example: /filter az-305\n")
+				} else {
+					filter = value
+				}
+			}
+			continue
 		}
 
-		switch answer {
-		case "y", "yes":
-			return true, nil
-		case "n", "no":
-			return false, nil
-		default:
-			printWarnf("Please answer y or n.\n")
+		choice, err := strconv.Atoi(raw)
+		if err != nil {
+			filter = raw
+			continue
+		}
+		if choice < 1 || choice > len(filtered) {
+			printWarnf("Invalid selection. Enter a listed number or one of the commands above.\n")
+			continue
+		}
+		return options[filtered[choice-1].RawIndex], nil
+	}
+}
+
+func parseMenuCommand(raw string) (command string, value string, ok bool) {
+	raw = strings.TrimSpace(raw)
+	if !strings.HasPrefix(raw, "/") {
+		return "", "", false
+	}
+	body := strings.TrimSpace(strings.TrimPrefix(raw, "/"))
+	if body == "" {
+		return "clear", "", true
+	}
+	fields := strings.Fields(body)
+	name := strings.ToLower(fields[0])
+	switch name {
+	case "refresh", "reload":
+		return "refresh", "", true
+	case "clear":
+		return "clear", "", true
+	case "scan", "all":
+		return name, "", true
+	case "filter", "f":
+		return "filter", strings.TrimSpace(body[len(fields[0]):]), true
+	default:
+		// Preserve the original shorthand where /az-305 meant "filter az-305".
+		return "filter", body, true
+	}
+}
+
+func newCLIProgressReporter() fetch.ProgressFunc {
+	lastPrinted := time.Time{}
+	lastPhase := ""
+	lastCompleted := -1
+	return func(progress fetch.Progress) {
+		if progress.FromCache {
+			if progress.Phase != lastPhase {
+				printSuccessf("Loaded cached discussion index: %d page(s), %d exam(s), %d cached link(s).\n",
+					progress.Total, progress.Found, progress.CacheHits)
+				lastPhase = progress.Phase
+			}
+			return
+		}
+		now := time.Now()
+		if !progress.Complete && progress.Completed == lastCompleted && now.Sub(lastPrinted) < time.Second {
+			return
+		}
+		if !progress.Complete && !lastPrinted.IsZero() && now.Sub(lastPrinted) < time.Second {
+			return
+		}
+		lastPrinted = now
+		lastPhase = progress.Phase
+		lastCompleted = progress.Completed
+		switch progress.Phase {
+		case "discussion-index":
+			printInfof("Scanning discussion pages %d/%d · %d exam codes found · %d retries · %d failures · %.1f rps · %s\n",
+				progress.Completed, progress.Total, progress.Found, progress.Retries, progress.Failures,
+				progress.Rate, progress.Elapsed.Round(time.Second))
+		case "questions":
+			printInfof("Downloading questions %d/%d · %d extracted · %d cache hits · %d retries · %d failures · %s\n",
+				progress.Completed, progress.Total, progress.Found, progress.CacheHits,
+				progress.Retries, progress.Failures, progress.Elapsed.Round(time.Second))
 		}
 	}
 }
@@ -277,7 +401,7 @@ func promptYesNo(reader *bufio.Reader, prompt string, defaultYes bool) (bool, er
 // window in days. Blank input means "keep all" (returns 0). Re-prompts on
 // non-numeric or negative input.
 func promptRecentCommentsDays(reader *bufio.Reader) (int, error) {
-	prompt := "Keep only questions with a comment in the last N days? (e.g. 180 = ~6 months, 365 = ~12 months; blank = keep all): "
+	prompt := "Filter by dated comment activity in the last N days? (180 = ~6 months; blank = no date filter; unknown dates remain): "
 	for {
 		fmt.Print(style(prompt, ansiBold+ansiCyan))
 
@@ -293,7 +417,7 @@ func promptRecentCommentsDays(reader *bufio.Reader) (int, error) {
 
 		days, err := strconv.Atoi(answer)
 		if err != nil || days < 0 {
-			printWarnf("Please enter a positive number of days, or leave blank to keep all.\n")
+			printWarnf("Please enter a positive number of days, or leave blank to disable the date filter.\n")
 			continue
 		}
 		return days, nil
@@ -330,7 +454,7 @@ func promptSelectionWithRefresh(
 		}
 		printMenuHelp()
 
-		fmt.Print(style("Select> ", ansiBold+ansiCyan))
+		fmt.Print(style("Provider> ", ansiBold+ansiCyan))
 		raw, err := reader.ReadString('\n')
 		if err != nil {
 			return "", err
@@ -341,10 +465,9 @@ func promptSelectionWithRefresh(
 			continue
 		}
 
-		if strings.HasPrefix(raw, "/") {
-			command := strings.TrimSpace(strings.TrimPrefix(raw, "/"))
-			switch strings.ToLower(command) {
-			case "":
+		if command, value, isCommand := parseMenuCommand(raw); isCommand {
+			switch command {
+			case "clear":
 				filter = ""
 			case "refresh":
 				printInfof("Refreshing list...\n")
@@ -356,14 +479,24 @@ func promptSelectionWithRefresh(
 					filter = ""
 					printSuccessf("List refreshed. %d option(s) available.\n", len(options))
 				}
+			case "filter":
+				if value == "" {
+					printWarnf("Filter text is missing. Example: /filter microsoft\n")
+				} else {
+					filter = value
+				}
 			default:
-				filter = command
+				printWarnf("That command is only available in the exam menu.\n")
 			}
 			continue
 		}
 
 		choice, err := strconv.Atoi(raw)
-		if err != nil || choice < 1 || choice > len(filtered) {
+		if err != nil {
+			filter = raw
+			continue
+		}
+		if choice < 1 || choice > len(filtered) {
 			printWarnf("Invalid selection. Please enter a valid number.\n")
 			continue
 		}
@@ -461,7 +594,21 @@ func printMenuHeader(title string, shown int, total int, filter string) {
 }
 
 func printMenuHelp() {
-	fmt.Println(style(" Commands: [number] select | /text filter | / clear | /refresh refetch", ansiGray))
+	fmt.Println(style(" Enter one item, then press Enter:", ansiGray))
+	fmt.Println(style("   microsoft   Find providers containing microsoft", ansiGray))
+	fmt.Println(style("   1           Select displayed item 1", ansiGray))
+	fmt.Println(style("   /clear      Show the full provider list again", ansiGray))
+	fmt.Println(style("   /reload     Fetch the provider list again", ansiGray))
+}
+
+func printExamMenuHelp() {
+	fmt.Println(style(" Enter one item, then press Enter:", ansiGray))
+	fmt.Println(style("   az-305      Find exams containing az-305", ansiGray))
+	fmt.Println(style("   1           Select displayed item 1", ansiGray))
+	fmt.Println(style("   /clear      Show the full exam list again", ansiGray))
+	fmt.Println(style("   /reload     Fetch the official exam list again", ansiGray))
+	fmt.Println(style("   /scan       Find more exams from discussions (up to 2 minutes)", ansiGray))
+	fmt.Println(style("   /all        Download every indexed public discussion for this provider", ansiGray))
 }
 
 func printInfof(format string, args ...any) {
@@ -492,16 +639,28 @@ func detectANSI() bool {
 	if err != nil {
 		return false
 	}
-	if (stat.Mode() & os.ModeCharDevice) == 0 {
+	if !supportsANSI(runtime.GOOS, (stat.Mode()&os.ModeCharDevice) != 0, os.LookupEnv) {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("NO_COLOR")), "1") {
+	if runtime.GOOS == "windows" {
+		return enableVirtualTerminal()
+	}
+	return true
+}
+
+func supportsANSI(goos string, terminal bool, lookupEnv func(string) (string, bool)) bool {
+	if !terminal {
 		return false
 	}
-	term := strings.TrimSpace(strings.ToLower(os.Getenv("TERM")))
+	if _, disabled := lookupEnv("NO_COLOR"); disabled {
+		return false
+	}
+	termValue, _ := lookupEnv("TERM")
+	term := strings.TrimSpace(strings.ToLower(termValue))
 	if term == "dumb" {
 		return false
 	}
+	_ = goos
 	return true
 }
 

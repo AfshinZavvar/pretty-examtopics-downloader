@@ -604,11 +604,11 @@ func renderQuestionCard(
 
 	fmt.Fprintf(&b, "        <div class=\"result-bar\" id=\"%s-result\"></div>\n", qid)
 	b.WriteString("        <div class=\"q-actions\">\n")
-	fmt.Fprintf(&b, "            <button class=\"btn btn-submit\" id=\"%s-submit\" onclick=\"submit('%s')\" disabled>Submit</button>\n", qid, qid)
-	fmt.Fprintf(&b, "            <button class=\"btn btn-cheat\" id=\"%s-cheat\" onclick=\"cheat('%s')\">Sneak Peek</button>\n", qid, qid)
+	fmt.Fprintf(&b, "            <button class=\"btn btn-submit\" id=\"%s-submit\" onclick=\"submit('%s')\" disabled>Submit answer</button>\n", qid, qid)
+	fmt.Fprintf(&b, "            <button class=\"btn btn-cheat\" id=\"%s-cheat\" onclick=\"cheat('%s')\">Reveal answer</button>\n", qid, qid)
 	fmt.Fprintf(&b, "            <a class=\"btn btn-discuss hidden\" id=\"%s-discuss\" href=\"#\" target=\"_blank\">ExamTopics</a>\n", qid)
 	fmt.Fprintf(&b, "            <button class=\"btn btn-comments\" id=\"%s-comments\" onclick=\"openComments('%s')\">Comments</button>\n", qid, qid)
-	fmt.Fprintf(&b, "            <button class=\"btn btn-reset hidden\" id=\"%s-reset\" onclick=\"reset('%s')\">Retry</button>\n", qid, qid)
+	fmt.Fprintf(&b, "            <button class=\"btn btn-reset hidden\" id=\"%s-reset\" onclick=\"reset('%s')\">Try again</button>\n", qid, qid)
 	b.WriteString("        </div>\n")
 	b.WriteString("    </div>\n")
 	b.WriteString("</div>")
@@ -868,6 +868,7 @@ func renderHotAreaFallbackBlock(b *strings.Builder, answerExhibitURLs []string) 
 //   - "\n" denotes a line break (rendered as <br>)
 //   - "[[IMG:<url>]]" denotes an inline image
 //   - http(s) URLs are rendered as clickable links
+//
 // Everything else is HTML-escaped.
 func renderAnswerDescriptionHTML(text string) string {
 	if text == "" {
