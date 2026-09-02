@@ -11,6 +11,10 @@ examtopics_output.pdf
 *.md
 *.pdf
 
+# Keep project documentation trackable.
+!README.md
+!PROJECT_OVERVIEW.md
+
 # Environment
 env/
 .env

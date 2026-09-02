@@ -21,6 +21,7 @@ var pageCacheEnabled = true
 // -no-cache CLI flag when the user wants guaranteed-fresh content.
 func SetCacheEnabled(enabled bool) {
 	pageCacheEnabled = enabled
+	providerIndexCacheEnabled = enabled
 }
 
 var (

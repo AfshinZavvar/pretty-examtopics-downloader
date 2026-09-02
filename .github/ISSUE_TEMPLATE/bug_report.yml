@@ -21,7 +21,9 @@ body:
           required: true
         - label: I searched [existing issues](../issues?q=is%3Aissue) and didn't find a duplicate.
           required: true
-        - label: I tried again with `-no-cache` (and/or cleared the page cache) to rule out a stale cached page.
+        - label: If the output was `.partial.html`, I reran normally or used `/scan` again so cached provider discovery could resume.
+          required: false
+        - label: I tried `-no-cache` only if I suspected corrupt/stale cached pages (this restarts provider discovery and is not a completeness shortcut).
           required: false
 
   - type: dropdown
@@ -30,7 +32,7 @@ body:
       label: What kind of problem is it?
       options:
         - "Extraction failed / no questions found"
-        - "Missing questions (fewer than the source exam)"
+        - "Missing public questions / incomplete discovery"
         - "Wrong or missing answers"
         - "Broken/missing images or formatting in the HTML"
         - "Crash / panic / error message"
@@ -69,7 +71,7 @@ body:
     id: what-happened
     attributes:
       label: What happened?
-      description: Describe the problem. For wrong/missing answers, include the question number and what you expected vs. what was produced.
+      description: Describe the problem. For missing questions, include provider scan coverage, advertised count, public discussion-backed count, and whether the output ended in `.partial.html`. For answer issues, include the question number and expected result.
     validations:
       required: true
 

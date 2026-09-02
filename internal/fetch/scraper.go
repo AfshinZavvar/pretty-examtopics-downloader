@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"html"
@@ -17,15 +18,22 @@ import (
 	"examtopics-downloader/internal/utils"
 
 	"github.com/PuerkitoBio/goquery"
-	"github.com/cheggaaa/pb/v3"
 	xhtml "golang.org/x/net/html"
 )
 
 func getDataFromLink(link string, solutions map[string]*models.AnswerSolution) *models.QuestionData {
-	doc, err := ParseHTMLCached(link, *client)
+	data, _, _, err := getDataFromLinkContext(context.Background(), link, solutions)
 	if err != nil {
 		debugf("failed parsing HTML data from link: %v", err)
 		return nil
+	}
+	return data
+}
+
+func getDataFromLinkContext(ctx context.Context, link string, solutions map[string]*models.AnswerSolution) (*models.QuestionData, bool, int, error) {
+	doc, fromCache, metrics, err := ParseHTMLCachedContext(ctx, link, *client, QuestionRequestPolicy)
+	if err != nil {
+		return nil, false, metrics.Retries, err
 	}
 
 	allQuestions := extractAnswerOptions(doc)
@@ -107,7 +115,7 @@ func getDataFromLink(link string, solutions map[string]*models.AnswerSolution) *
 		QuestionID:        questionID,
 		Comments:          extractDiscussionComments(doc),
 		Solution:          solution,
-	}
+	}, fromCache, metrics.Retries, nil
 }
 
 // answerOptionSelectors lists CSS selectors to try (in order) when scraping
@@ -489,165 +497,138 @@ func normalizeCommentText(raw string) string {
 }
 
 func listingPageURL(providerName string, page int) string {
-	return fmt.Sprintf("https://www.examtopics.com/discussions/%s/%d", providerName, page)
+	return fmt.Sprintf("%s/discussions/%s/%d", examTopicsBaseURL, providerName, page)
 }
 
-func fetchAllPageLinksConcurrently(providerName, selectedExam string, numPages, concurrency int, onPageProcessed func()) []string {
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, concurrency)
-
-	pageResults := make([][]string, numPages+1) // 1-indexed by page number
-	var failedMu sync.Mutex
-	var failedPages []int
-
-	for i := 1; i <= numPages; i++ {
-		wg.Add(1)
-		go func(i int) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			requestLimiter.Wait()
-
-			links, ok := getLinksFromPageWithStatus(providerName, listingPageURL(providerName, i), selectedExam)
-			if ok {
-				pageResults[i] = links
-			} else {
-				// Don't silently drop ~10 questions per failed listing page —
-				// record it for the sequential retry pass below.
-				failedMu.Lock()
-				failedPages = append(failedPages, i)
-				failedMu.Unlock()
-			}
-			if onPageProcessed != nil {
-				onPageProcessed()
-			}
-		}(i)
-	}
-
-	wg.Wait()
-
-	// Retry listing pages that failed on the first pass, sequentially and under
-	// slow pacing — most failures are transient rate-limiting/anti-bot hiccups
-	// that recover when we stop hammering the server.
-	if len(failedPages) > 0 {
-		sort.Ints(failedPages)
-		fmt.Fprintf(os.Stderr, "[INFO] %d listing page(s) failed on first pass; retrying sequentially...\n", len(failedPages))
-		retryLimiter := utils.CreateRateLimiter(1.0)
-		defer retryLimiter.Stop()
-
-		var stillFailed []int
-		for _, i := range failedPages {
-			<-retryLimiter.C
-			if links, ok := getLinksFromPageWithStatus(providerName, listingPageURL(providerName, i), selectedExam); ok {
-				pageResults[i] = links
-			} else {
-				stillFailed = append(stillFailed, i)
-			}
-		}
-		if len(stillFailed) > 0 {
-			fmt.Fprintf(os.Stderr, "[WARN] %d listing page(s) could not be fetched after retry; some questions may be missing: %v\n", len(stillFailed), stillFailed)
-		}
-	}
-
-	// about 10 questions per examtopics page, we can preallocate
-	all := make([]string, 0, numPages*10)
-	for i := 1; i <= numPages; i++ {
-		all = append(all, pageResults[i]...)
-	}
-
-	return all
+func questionPageURL(link string) string {
+	return strings.TrimRight(examTopicsBaseURL, "/") + "/" + strings.TrimLeft(link, "/")
 }
 
-// Main concurrent page scraping logic
-func GetAllPages(providerName string, selectedExam string) []models.QuestionData {
-	baseURL := fmt.Sprintf("https://www.examtopics.com/discussions/%s/", providerName)
-	numPages := getMaxNumPages(baseURL)
+type questionPageResult struct {
+	index     int
+	data      *models.QuestionData
+	fromCache bool
+	retries   int
+	err       error
+}
+
+// GetAllPages reuses the provider discussion index, filters it locally, and
+// processes question pages through a fixed worker pool. Result order follows
+// topic/question order rather than network completion order.
+func GetAllPages(ctx context.Context, providerName string, selectedExam string, report ProgressFunc) ([]models.QuestionData, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	startTime := utils.StartTime()
-	bar := pb.StartNew(numPages)
+	index, indexErr := GetProviderDiscussionIndex(ctx, providerName, IndexOptions{}, report)
+	if indexErr != nil {
+		fmt.Fprintf(os.Stderr, "[WARN] Question discovery is partial: scanned %d of %d provider discussion pages.\n", len(index.CompletedPages), index.TotalPages)
+		fmt.Fprintf(os.Stderr, "[WARN] Run the downloader again (or use /scan again) to resume the missing pages. Completed pages are cached.\n")
+	}
 
-	allLinks := fetchAllPageLinksConcurrently(providerName, selectedExam, numPages, constants.MaxConcurrentRequests, func() {
-		bar.Increment()
-	})
-
+	allLinks := make([]string, 0, len(index.Links))
+	for _, link := range index.Links {
+		if matchesExamSelection(providerName, selectedExam, link) {
+			allLinks = append(allLinks, link)
+		}
+	}
 	unique := utils.DeduplicateLinks(allLinks)
 	sortedLinks := utils.SortLinksByQuestionNumber(unique)
+	if strings.TrimSpace(selectedExam) == "" {
+		fmt.Printf("[INFO] Found %d indexed public discussion page(s) for %s.\n", len(sortedLinks), providerName)
+	} else {
+		fmt.Printf("[INFO] Found %d public discussion-backed question page(s) matching %s.\n", len(sortedLinks), selectedExam)
+	}
+	if strings.TrimSpace(selectedExam) != "" {
+		if advertised, err := GetOfficialExamQuestionCount(ctx, providerName, selectedExam); err == nil {
+			fmt.Printf("[INFO] ExamTopics currently advertises %d total question(s) for %s.\n", advertised, strings.ToUpper(selectedExam))
+			if advertised > len(sortedLinks) {
+				if index.Complete {
+					fmt.Fprintf(os.Stderr, "[WARN] %d advertised question(s) have no public discussion page in the complete provider index or require site access.\n", advertised-len(sortedLinks))
+				} else {
+					fmt.Fprintf(os.Stderr, "[WARN] The current HTML cannot be considered complete until all %d provider discussion pages have been scanned.\n", index.TotalPages)
+				}
+			}
+		}
+	}
 	if summary := buildSelectedExamVariantSummary(providerName, selectedExam, sortedLinks); summary != "" {
 		fmt.Printf("\n%s\n", summary)
 	}
-	bar.SetTotal(int64(numPages + len(sortedLinks)))
-
 	if len(sortedLinks) == 0 {
-		bar.Finish()
-		fmt.Println("No matching questions were found.")
-		return nil
+		if indexErr != nil {
+			return nil, fmt.Errorf("no matching questions found in partial provider index: %w", indexErr)
+		}
+		return nil, fmt.Errorf("no matching questions were found")
 	}
 
-	// Fetch the canonical "Reveal Solution" payload for whichever questions
-	// ExamTopics exposes without authentication on /exams/{p}/{e}/view/.
-	// This is best-effort: the typical free quota is the first ~5 questions
-	// per exam. For everything else, we fall back to the discussion-page
-	// data and surface the limitation in a one-line log.
-	solutions := FetchViewSolutions(providerName, selectedExam)
+	solutions, solutionErr := FetchViewSolutionsContext(ctx, providerName, selectedExam)
+	if solutionErr != nil {
+		debugf("view-solutions: %v", solutionErr)
+	}
 	if len(solutions) > 0 {
-		fmt.Fprintf(os.Stderr, "[INFO] Fetched canonical answers for %d question(s) from /exams/%s/%s/view/.\n", len(solutions), providerName, selectedExam)
-	} else {
-		debugf("view-solutions: no canonical answers retrieved for %s/%s", providerName, selectedExam)
+		fmt.Fprintf(os.Stderr, "[INFO] The anonymous ExamTopics viewer exposed site-provided answers for %d question(s).\n", len(solutions))
 	}
 
-	var wg sync.WaitGroup
-	sem := make(chan struct{}, constants.MaxConcurrentRequests)
+	jobs := make(chan int)
+	pageResults := make(chan questionPageResult, constants.MaxConcurrentRequests)
 	results := make([]*models.QuestionData, len(sortedLinks))
-
-	for i, link := range sortedLinks {
-		wg.Add(1)
-		url := utils.AddToBaseUrl(link)
-
-		go func(i int, url string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-
-			// Only spend the rate budget when we'll actually hit the network;
-			// cache hits return instantly and shouldn't be paced.
-			if !isPageCached(url) {
-				requestLimiter.Wait()
+	var workers sync.WaitGroup
+	for worker := 0; worker < constants.MaxConcurrentRequests; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for i := range jobs {
+				url := questionPageURL(sortedLinks[i])
+				data, fromCache, retries, err := getDataFromLinkContext(ctx, url, solutions)
+				select {
+				case pageResults <- questionPageResult{index: i, data: data, fromCache: fromCache, retries: retries, err: err}:
+				case <-ctx.Done():
+					return
+				}
 			}
-
-			data := getDataFromLink(url, solutions)
-			if data != nil {
-				results[i] = data
-			}
-			bar.Increment()
-		}(i, url)
+		}()
 	}
-
-	wg.Wait()
-	bar.Finish()
-
-	// Sequentially retry any links that came back nil — most are transient
-	// rate-limit or transport failures that recover under slower pacing.
-	missingIdx := make([]int, 0)
-	for i, entry := range results {
-		if entry == nil {
-			missingIdx = append(missingIdx, i)
-		}
-	}
-	if len(missingIdx) > 0 {
-		fmt.Fprintf(os.Stderr, "[INFO] %d question page(s) failed on first pass; retrying sequentially...\n", len(missingIdx))
-		retryLimiter := utils.CreateRateLimiter(1.0)
-		defer retryLimiter.Stop()
-		for _, i := range missingIdx {
-			<-retryLimiter.C
-			url := utils.AddToBaseUrl(sortedLinks[i])
-			if data := getDataFromLink(url, solutions); data != nil {
-				results[i] = data
+	go func() {
+		defer close(jobs)
+		for i := range sortedLinks {
+			select {
+			case jobs <- i:
+			case <-ctx.Done():
+				return
 			}
 		}
+	}()
+	go func() {
+		workers.Wait()
+		close(pageResults)
+	}()
+
+	completed := 0
+	found := 0
+	retries := 0
+	failures := 0
+	cacheHits := 0
+	for result := range pageResults {
+		completed++
+		retries += result.retries
+		if result.fromCache {
+			cacheHits++
+		}
+		if result.err != nil || result.data == nil {
+			failures++
+		} else {
+			results[result.index] = result.data
+			found++
+		}
+		reportProgress(report, Progress{
+			Phase: "questions", Completed: completed, Total: len(sortedLinks), Found: found,
+			Retries: retries, Failures: failures, CacheHits: cacheHits,
+			Complete: completed == len(sortedLinks), Rate: requestLimiter.RPS(), Elapsed: time.Since(startTime),
+		})
 	}
 
-	var finalData []models.QuestionData
-	var failedLinks []string
+	finalData := make([]models.QuestionData, 0, found)
+	failedLinks := make([]string, 0, failures)
 	for i, entry := range results {
 		if entry != nil {
 			finalData = append(finalData, *entry)
@@ -656,27 +637,33 @@ func GetAllPages(providerName string, selectedExam string) []models.QuestionData
 		}
 	}
 
-	total := len(sortedLinks)
-	got := len(finalData)
-	if got < total {
-		fmt.Fprintf(os.Stderr, "[WARN] Extracted %d of %d question pages (%d failed).\n", got, total, total-got)
-		preview := failedLinks
-		if len(preview) > 10 {
-			preview = preview[:10]
-		}
-		for _, link := range preview {
+	if len(failedLinks) > 0 {
+		fmt.Fprintf(os.Stderr, "[WARN] Extracted %d of %d question pages (%d failed).\n", len(finalData), len(sortedLinks), len(failedLinks))
+		for i, link := range failedLinks {
+			if i == 10 {
+				fmt.Fprintf(os.Stderr, "  ... and %d more.\n", len(failedLinks)-i)
+				break
+			}
 			fmt.Fprintf(os.Stderr, "  - %s\n", link)
 		}
-		if len(failedLinks) > len(preview) {
-			fmt.Fprintf(os.Stderr, "  ... and %d more.\n", len(failedLinks)-len(preview))
-		}
 	} else {
-		fmt.Printf("Extracted %d of %d question pages.\n", got, total)
+		fmt.Printf("Extracted %d of %d question pages.\n", len(finalData), len(sortedLinks))
 	}
+	fmt.Printf("Extraction complete in %s (%d cache hits, %d retries).\n", utils.TimeSince(startTime), cacheHits, retries)
 
-	fmt.Printf("Extraction complete in %s.\n", utils.TimeSince(startTime))
-
-	return finalData
+	if err := ctx.Err(); err != nil {
+		return finalData, err
+	}
+	if len(finalData) == 0 {
+		return nil, fmt.Errorf("all %d question pages failed", len(sortedLinks))
+	}
+	if indexErr != nil {
+		return finalData, fmt.Errorf("question discovery is incomplete (%d of %d provider pages scanned): %w", len(index.CompletedPages), index.TotalPages, indexErr)
+	}
+	if len(failedLinks) > 0 {
+		return finalData, fmt.Errorf("question extraction is incomplete: %d of %d discovered pages failed", len(failedLinks), len(sortedLinks))
+	}
+	return finalData, nil
 }
 
 func buildSelectedExamVariantSummary(providerName, selectedExam string, links []string) string {

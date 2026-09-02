@@ -4,15 +4,18 @@ import "time"
 
 // Request behaviour
 const HttpTimeout = 20 * time.Second
+const MetadataRequestTimeout = 10 * time.Second
 
 // MaxConcurrentRequests caps in-flight requests. Note the adaptive limiter
 // (below) gates how fast new requests *start*, so this is an upper bound on
 // parallelism, not the effective throughput on its own.
 const MaxConcurrentRequests = 15
+const DiscoveryWorkers = 8
+const DiscoveryTimeout = 2 * time.Minute
+const DiscoveryCheckpointPages = 10
 
-// RequestsPerSecond is the fixed pace used by the sequential retry pass.
-const RequestsPerSecond = 2.0
 const MaxRetries = 3
+const MetadataMaxRetries = 1
 
 // Adaptive request pacing (AIMD). The main fan-out starts at
 // StartRequestsPerSecond and only speeds up by RateIncreaseStep after

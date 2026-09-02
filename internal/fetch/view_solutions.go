@@ -1,6 +1,7 @@
 package fetch
 
 import (
+	"context"
 	"fmt"
 	"regexp"
 	"strings"
@@ -23,23 +24,28 @@ var imageMarkerRemovePattern = regexp.MustCompile(`\[\[IMG:[^\]]+\]\]`)
 // On any HTTP / parse failure the function returns an empty (non-nil) map
 // rather than an error — solution data is best-effort.
 func FetchViewSolutions(provider, examSlug string) map[string]*models.AnswerSolution {
+	out, _ := FetchViewSolutionsContext(context.Background(), provider, examSlug)
+	return out
+}
+
+func FetchViewSolutionsContext(ctx context.Context, provider, examSlug string) (map[string]*models.AnswerSolution, error) {
 	out := map[string]*models.AnswerSolution{}
 	provider = strings.TrimSpace(strings.ToLower(provider))
 	examSlug = strings.TrimSpace(strings.ToLower(examSlug))
 	if provider == "" || examSlug == "" {
-		return out
+		return out, nil
 	}
 
-	url := fmt.Sprintf("https://www.examtopics.com/exams/%s/%s/view/", provider, examSlug)
-	doc, err := ParseHTML(url, *client)
+	url := fmt.Sprintf("%s/exams/%s/%s/view/", examTopicsBaseURL, provider, examSlug)
+	doc, _, err := ParseHTMLContext(ctx, url, *client, MetadataRequestPolicy)
 	if err != nil {
 		debugf("view-solutions: parse failed for %s: %v", url, err)
-		return out
+		return out, err
 	}
 
 	parseViewSolutionsFromDoc(doc, out)
 	debugf("view-solutions: collected %d canonical answer(s) from %s", len(out), url)
-	return out
+	return out, nil
 }
 
 // parseViewSolutionsFromDoc populates dst with one entry per question-body on

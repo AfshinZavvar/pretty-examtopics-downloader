@@ -1,6 +1,7 @@
 package utils
 
 import (
+	"context"
 	"examtopics-downloader/internal/constants"
 	"examtopics-downloader/internal/models"
 	"fmt"
@@ -188,18 +189,40 @@ func (a *AdaptiveLimiter) intervalLocked() time.Duration {
 // Wait blocks until the next request is allowed under the current rate. Safe
 // for concurrent use: grants are serialized and evenly spaced.
 func (a *AdaptiveLimiter) Wait() {
+	_ = a.WaitContext(context.Background())
+}
+
+// WaitContext is Wait with cancellation support. A cancelled discovery or
+// extraction should not remain parked behind a previously scheduled token.
+func (a *AdaptiveLimiter) WaitContext(ctx context.Context) error {
+	return a.WaitContextAfter(ctx, 0)
+}
+
+// WaitContextAfter grants one globally paced request no earlier than
+// minimumDelay from now. Combining the limiter reservation and retry backoff
+// here ensures callers wait once (for the greater delay), rather than sleeping
+// for backoff and then sleeping again for request pacing.
+func (a *AdaptiveLimiter) WaitContextAfter(ctx context.Context, minimumDelay time.Duration) error {
 	a.mu.Lock()
 	now := time.Now()
-	if a.next.Before(now) {
-		a.next = now
+	earliest := now.Add(minimumDelay)
+	if a.next.Before(earliest) {
+		a.next = earliest
 	}
 	wait := a.next.Sub(now)
 	a.next = a.next.Add(a.intervalLocked())
 	a.mu.Unlock()
 
 	if wait > 0 {
-		time.Sleep(wait)
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
 	}
+	return nil
 }
 
 // OnSuccess records a successful response. After streakGoal consecutive

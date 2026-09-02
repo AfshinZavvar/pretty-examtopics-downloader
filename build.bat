@@ -2,7 +2,7 @@
 setlocal EnableExtensions EnableDelayedExpansion
 
 set "APP_NAME=examtopics-downloader"
-set "ENTRY=.\cmd\main.go"
+set "ENTRY=.\cmd"
 set "DIST_DIR=dist"
 set "ARCH=%~1"
 set "COMPRESS=%~2"
